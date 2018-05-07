@@ -1500,7 +1500,7 @@ MetaTrackValidKindNsp(Form_pg_class rd_rel)
  */
 void
 RemoveRelation(const RangeVar *relation, DropBehavior behavior,
-			   DropStmt *stmt)
+			   DropStmt *stmt, char relkind)
 {
 	Oid			relOid;
 	ObjectAddress object;
@@ -1509,16 +1509,24 @@ RemoveRelation(const RangeVar *relation, DropBehavior behavior,
 
 	AcceptInvalidationMessages();
 
-	relOid = RangeVarGetRelid(relation, false, false /*allowHcatalog*/);
+	relOid = RangeVarGetRelid(relation, true, false /*allowHcatalog*/);
+
+	/* Not there? */
+	if (!OidIsValid(relOid))
+	{
+		DropErrorMsgNonExistent(relation, relkind, stmt->missing_ok);
+		return;
+	}
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
 		LockRelationOid(RelationRelationId, RowExclusiveLock);
 		LockRelationOid(TypeRelationId, RowExclusiveLock);
 		LockRelationOid(DependRelationId, RowExclusiveLock);
-	}
 
-	LockRelationOid(relOid, AccessExclusiveLock);
+		/* Get the lock before trying to fetch the pg_class entry */
+		LockRelationOid(relOid, AccessExclusiveLock);
+	}
 
 	pcqCtx = caql_beginscan(
 			NULL,
@@ -1530,7 +1538,28 @@ RemoveRelation(const RangeVar *relation, DropBehavior behavior,
 	tuple = caql_getnext(pcqCtx);
 
 	if (!HeapTupleIsValid(tuple))
+	{
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			Oid again = RangeVarGetRelid(relation, true, false /*allowHcatalog*/);
+
+			/* Not there? */
+			if (!OidIsValid(again))
+			{
+				DropErrorMsgNonExistent(relation, relkind, stmt->missing_ok);
+
+				UnlockRelationOid(DependRelationId, RowExclusiveLock);
+				UnlockRelationOid(TypeRelationId, RowExclusiveLock);
+				UnlockRelationOid(RelationRelationId, RowExclusiveLock);
+
+				UnlockRelationOid(relOid, AccessExclusiveLock);
+
+				caql_endscan(pcqCtx);
+				return;
+			}
+		}
 		elog(ERROR, "relation \"%s\" does not exist", relation->relname);
+	}
 
 	/* MPP-3260: disallow direct DROP TABLE of a partition */
 	if (stmt && rel_is_child_partition(relOid) && !stmt->bAllowPartn)
@@ -7742,6 +7771,7 @@ ATExecDropColumn(List **wqueue, Relation rel, const char *colName,
 			if (attnum == policy->attrs[ia])
 			{
 				policy->nattrs = 0;
+				policy->bucketnum = 0;
 				rel->rd_cdbpolicy = GpPolicyCopy(GetMemoryChunkContext(rel), policy);
 				GpPolicyReplace(RelationGetRelid(rel), policy);
 				if (Gp_role != GP_ROLE_EXECUTE)
@@ -13078,6 +13108,11 @@ ATExecSetDistributedBy(Relation rel, Node *node, AlterTableCmd *cmd)
 			policy = (GpPolicy *) palloc(sizeof(GpPolicy));
 			policy->ptype = POLICYTYPE_PARTITIONED;
 			policy->nattrs = 0;
+			/**
+			 * consider user can modify default_hash_table_bucket_number in session,
+			 * should set bucketnum to the current hash_table_bucket_number during reorganize table
+			 */
+			policy->bucketnum = GetHashDistPartitionNum();
 
 			rel->rd_cdbpolicy = GpPolicyCopy(GetMemoryChunkContext(rel),
 										 policy);
@@ -13122,6 +13157,11 @@ ATExecSetDistributedBy(Relation rel, Node *node, AlterTableCmd *cmd)
 							sizeof(policy->attrs[0]) * list_length(ldistro));
 			policy->ptype = POLICYTYPE_PARTITIONED;
 			policy->nattrs = 0;
+			/**
+			 * consider user can modify default_hash_table_bucket_number in session,
+			 * should set bucketnum to the current hash_table_bucket_number during reorganize table
+			 */
+			policy->bucketnum = GetHashDistPartitionNum();
 
 			/* Step (a) */
 			if (!rand_pol)

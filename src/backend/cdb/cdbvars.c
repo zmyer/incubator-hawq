@@ -234,7 +234,10 @@ int 		gp_hashagg_spillbatch_min = 0;
 int 		gp_hashagg_spillbatch_max = 0;
 
 /* hash join to use bloom filter: default to 0, means not used */
-int 	 	gp_hashjoin_bloomfilter = 0;
+int 	 	hawq_hashjoin_bloomfilter = 0;
+
+/* maximum memory size for one Bloom filter */
+char*		hawq_hashjoin_bloomfilter_max_memory_size;
 
 /* Analyzing aid */
 int 		gp_motion_slice_noop = 0;

@@ -65,14 +65,18 @@ void build_http_header(PxfInputData *input)
 	
 	if (proj_info != NULL && proj_info->pi_isVarList)
 	{
-		List* qualsAttributes = extractPxfAttributes(input->quals);
+		bool qualsAreSupported = true;
+		List* qualsAttributes = extractPxfAttributes(input->quals, &qualsAreSupported);
 		/* projection information is incomplete if columns from WHERE clause wasn't extracted */
-		if (qualsAttributes !=  NIL || list_length(input->quals) == 0)
+		/* if any of expressions in WHERE clause is not supported - do not send any projection information at all*/
+		if (qualsAreSupported && (qualsAttributes !=  NIL || list_length(input->quals) == 0))
 		{
 			add_projection_desc_httpheader(headers, proj_info, qualsAttributes);
 		}
 		else
+		{
 			elog(DEBUG2, "Query will not be optimized to use projection information");
+		}
 	}
 
 	/* GP cluster configuration */
@@ -109,6 +113,18 @@ void build_http_header(PxfInputData *input)
 	}
 	else
 		churl_headers_append(headers, "X-GP-HAS-FILTER", "0");
+
+	/* Aggregate information */
+	if (input->agg_type) {
+		switch(input->agg_type) {
+		case EXEC_FLAG_EXTERNAL_AGG_COUNT:
+			churl_headers_append(headers, "X-GP-AGG-TYPE", "count");
+			break;
+		default:
+			churl_headers_append(headers, "X-GP-AGG-TYPE", "unknown");
+			break;
+		}
+	}
 
 	add_delegation_token_headers(headers, input);
 	add_remote_credentials(headers);

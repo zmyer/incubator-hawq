@@ -50,7 +50,7 @@ typedef struct ExtProtocolData
 	bool			prot_last_call;
 	List		   *prot_scanquals;
 	ExternalSelectDesc desc;
-
+	List		   *splits;			/* splits to read from external protocol */
 } ExtProtocolData;
 
 typedef ExtProtocolData *ExtProtocol;
@@ -66,8 +66,8 @@ typedef ExtProtocolData *ExtProtocol;
 #define EXTPROTOCOL_GET_USER_CTX(fcinfo)   (((ExtProtocolData*) fcinfo->context)->prot_user_ctx)
 #define EXTPROTOCOL_GET_SELECTDESC(fcinfo)   (((ExtProtocolData*) fcinfo->context)->desc)
 #define EXTPROTOCOL_GET_PROJINFO(fcinfo) (((ExtProtocolData*) fcinfo->context)->desc->projInfo)
+#define EXTPROTOCOL_GET_AGG_TYPE(fcinfo) (((ExtProtocolData*) fcinfo->context)->desc->agg_type)
 #define EXTPROTOCOL_IS_LAST_CALL(fcinfo)   (((ExtProtocolData*) fcinfo->context)->prot_last_call)
-
 #define EXTPROTOCOL_SET_LAST_CALL(fcinfo)  (((ExtProtocolData*) fcinfo->context)->prot_last_call = true)
 #define EXTPROTOCOL_SET_USER_CTX(fcinfo, p) \
 	(((ExtProtocolData*) fcinfo->context)->prot_user_ctx = p)
@@ -81,6 +81,17 @@ typedef enum ValidatorDirection
 } ValidatorDirection;
 
 /*
+ * Indicate the validator to validate arguments when creating external table or
+ * let validator fetch block location information. This design is to avoid
+ * changing catalog table.
+ */
+typedef enum ValidatorAction
+{
+	EXT_VALID_ACT_ARGUMENTS,
+	EXT_VALID_ACT_GETBLKLOC
+} ValidatorAction;
+
+/*
  * ExtProtocolValidatorData is the node type that is passed as fmgr "context" info
  * when a function is called by the External Table protocol manager.
  */
@@ -91,8 +102,15 @@ typedef struct ExtProtocolValidatorData
 	List 		  		*format_opts;
 	ValidatorDirection 	 direction;  /* validating read or write? */
 	char				*errmsg;		  /* the validation error upon return, if any */
-	
+	ValidatorAction		 action;	/* indicate what action should be done. */
+	bool				forceCreateDir;
 } ExtProtocolValidatorData;
+
+typedef struct ExtProtocolBlockLocationData
+{
+	NodeTag				 type;
+	List				*files;		/* List of blocklocation_file*/
+} ExtProtocolBlockLocationData;
 
 typedef ExtProtocolValidatorData *ExtProtocolValidator;
 

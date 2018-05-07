@@ -76,12 +76,15 @@
 #include "libpq/auth.h"
 #include "libpq/pqformat.h"
 #include "utils/workfile_mgr.h"
-
+#include "hdfs/hdfs.h"
 /* Debug_filerep_print guc temporaly added for troubleshooting */
 #include "utils/guc.h"
 #include "utils/faultinjector.h"
 
 #include "utils/memutils.h"
+
+#include "catalog/catalog.h"
+#include "catalog/catquery.h"
 
 bool	enable_secure_filesystem = 0;
 extern bool		filesystem_support_truncate;
@@ -228,6 +231,7 @@ typedef struct
  * hash table of hdfs file systems, key = hdfs:/<host>:<port>, value = hdfsFS
  */
 static HTAB * HdfsFsTable = NULL;
+static HTAB * HdfsFsTable4Drop = NULL;
 static MemoryContext HdfsGlobalContext = NULL;
 #define EXPECTED_MAX_HDFS_CONNECTIONS 10
 
@@ -298,7 +302,7 @@ static void CleanupTempFiles(bool isProcExit);
 static void RemovePgTempFilesInDir(const char *tmpdirname);
 static bool HasTempFilePrefix(char * fileName);
 
-static hdfsFS HdfsGetConnection(const char * path);
+static hdfsFS HdfsGetConnection(const char * path, bool isForDrop);
 static bool HdfsBasicOpenFile(FileName fileName, int fileFlags, int fileMode,
 							  char **hProtocol, hdfsFS *fs, hdfsFile *hFile);
 static const char * ConvertToUnixPath(const char * fileName, char * buffer,
@@ -1793,7 +1797,7 @@ AllocateDir(const char *dirname)
 			return NULL;
 		if (ConvertToUnixPath(dirname, unixpath, sizeof(unixpath)) == NULL)
 			return NULL;
-		if ((fs = HdfsGetConnection(dirname)) == NULL)
+		if ((fs = HdfsGetConnection(dirname, false)) == NULL)
 			return NULL;
 		/* TODO: add to filesystem! */
 		if ((info = hdfsListDirectory(fs, unixpath, &num)) == NULL)
@@ -2005,15 +2009,66 @@ void
 cleanup_filesystem_handler(void)
 {
 	HASH_SEQ_STATUS	status;
+	HASH_SEQ_STATUS status4drop;
 	struct FsEntry *entry;
 	char *protocol;
 
-	if (NULL == HdfsFsTable)
+	if (NULL == HdfsFsTable && NULL == HdfsFsTable4Drop)
 		return;
 
-	hash_seq_init(&status, HdfsFsTable);
+	if (NULL != HdfsFsTable) {
+		hash_seq_init(&status, HdfsFsTable);
 
-	while (NULL != (entry = hash_seq_search(&status)))
+		while (NULL != (entry = hash_seq_search(&status)))
+		{
+			if (HdfsParsePath(entry->host, &protocol, NULL, NULL, NULL) || NULL == protocol)
+			{
+				elog(WARNING, "cannot get protocol for host: %s", entry->host);
+				continue;
+			}
+
+			if (entry->fs)
+				HdfsDisconnect(protocol, entry->fs);
+			pfree(protocol);
+		}
+		hash_destroy(HdfsFsTable);
+		HdfsFsTable = NULL;
+	}
+
+	if (NULL != HdfsFsTable4Drop) {
+		hash_seq_init(&status4drop, HdfsFsTable4Drop);
+
+		while (NULL != (entry = hash_seq_search(&status4drop)))
+		{
+			if (HdfsParsePath(entry->host, &protocol, NULL, NULL, NULL) || NULL == protocol)
+			{
+				elog(WARNING, "cannot get protocol for host: %s", entry->host);
+				continue;
+			}
+
+			if (entry->fs)
+				HdfsDisconnect(protocol, entry->fs);
+			pfree(protocol);
+		}
+		hash_destroy(HdfsFsTable4Drop);
+		HdfsFsTable4Drop = NULL;
+	}
+	MemoryContextResetAndDeleteChildren(HdfsGlobalContext);
+}
+
+void
+cleanup_hdfs_handlers_for_dropping()
+{
+	HASH_SEQ_STATUS status4drop;
+	struct FsEntry *entry;
+	char *protocol;
+
+	if (NULL == HdfsFsTable4Drop)
+		return;
+
+	hash_seq_init(&status4drop, HdfsFsTable4Drop);
+
+	while (NULL != (entry = hash_seq_search(&status4drop)))
 	{
 		if (HdfsParsePath(entry->host, &protocol, NULL, NULL, NULL) || NULL == protocol)
 		{
@@ -2026,12 +2081,9 @@ cleanup_filesystem_handler(void)
 		pfree(protocol);
 	}
 
-	hash_destroy(HdfsFsTable);
-	HdfsFsTable = NULL;
-
-	MemoryContextResetAndDeleteChildren(HdfsGlobalContext);
+	hash_destroy(HdfsFsTable4Drop);
+	HdfsFsTable4Drop = NULL;
 }
-
 
 /*
  * closeAllVfds
@@ -2339,10 +2391,11 @@ HasTempFilePrefix(char * fileName)
  * 		hdfs:/<host>:<port>/...
  */
 static hdfsFS
-HdfsGetConnection(const char * path)
+HdfsGetConnection(const char * path, bool isForDrop)
 {
 	struct FsEntry * entry;
 	HASHCTL hash_ctl;
+	HASHCTL hash_ctl_4drop;
 	bool found;
 
 	char *host = NULL, *location = NULL, *protocol;
@@ -2363,15 +2416,16 @@ HdfsGetConnection(const char * path)
 		else
 			sprintf(location, "%s://%s/", protocol, host);
 
+		if (NULL == HdfsGlobalContext)
+		{
+			Assert(NULL != TopMemoryContext);
+			HdfsGlobalContext = AllocSetContextCreate(TopMemoryContext,
+					"HDFS Global Context", ALLOCSET_DEFAULT_MINSIZE,
+					ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+		}
+
 		if (NULL == HdfsFsTable)
 		{
-			if (NULL == HdfsGlobalContext)
-			{
-				Assert(NULL != TopMemoryContext);
-				HdfsGlobalContext = AllocSetContextCreate(TopMemoryContext,
-						"HDFS Global Context", ALLOCSET_DEFAULT_MINSIZE,
-						ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
-			}
 
 			MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 			hash_ctl.keysize = MAXPGPATH;
@@ -2380,8 +2434,9 @@ HdfsGetConnection(const char * path)
 			hash_ctl.hcxt = HdfsGlobalContext;
 
 			HdfsFsTable = hash_create("hdfs connections hash table",
-					EXPECTED_MAX_HDFS_CONNECTIONS, &hash_ctl,
-					HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+									  EXPECTED_MAX_HDFS_CONNECTIONS,
+									  &hash_ctl,
+									  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 
 			if (HdfsFsTable == NULL )
 			{
@@ -2389,6 +2444,30 @@ HdfsGetConnection(const char * path)
 				errno = EIO;
 				break;
 			}
+
+			elog(LOG, "created hash table for hdfs access.");
+		}
+
+		if (NULL == HdfsFsTable4Drop)
+		{
+			MemSet(&hash_ctl_4drop, 0, sizeof(hash_ctl_4drop));
+			hash_ctl_4drop.keysize = MAXPGPATH;
+			hash_ctl_4drop.entrysize = sizeof(struct FsEntry);
+			hash_ctl_4drop.hash = string_hash;
+			hash_ctl_4drop.hcxt = HdfsGlobalContext;
+
+			HdfsFsTable4Drop = hash_create("hash connections hash table for drop",
+										   EXPECTED_MAX_HDFS_CONNECTIONS,
+										   &hash_ctl_4drop,
+										   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+			if (HdfsFsTable4Drop == NULL )
+			{
+				elog(WARNING, "failed to create hash table for dropping table.");
+				errno = EIO;
+				break;
+			}
+
+			elog(LOG, "created hash table (4drop) for hdfs access.");
 		}
 
 		if (enable_secure_filesystem && Gp_role != GP_ROLE_EXECUTE)
@@ -2403,8 +2482,21 @@ HdfsGetConnection(const char * path)
 		    }
 		}
 
-		entry = (struct FsEntry *) hash_search(HdfsFsTable, location,
-				HASH_ENTER, &found);
+		/* If this is for normal connection, check from normal table, otherwise,
+		 * check the table for dropping. */
+		if (!isForDrop) {
+			entry = (struct FsEntry *) hash_search(HdfsFsTable,
+												   location,
+												   HASH_ENTER,
+												   &found);
+		}
+		else
+		{
+			entry = (struct FsEntry *) hash_search(HdfsFsTable4Drop,
+												   location,
+												   HASH_ENTER,
+												   &found);
+		}
 
 		if (!found)
 		{
@@ -2423,7 +2515,10 @@ HdfsGetConnection(const char * path)
 										errmsg("failed to get filesystem credential."),
 										errdetail("%s", HdfsGetLastError())));
 
-						hash_search(HdfsFsTable, location, HASH_REMOVE, &found);
+						if (!isForDrop)
+						    hash_search(HdfsFsTable, location, HASH_REMOVE, &found);
+						else
+							hash_search(HdfsFsTable4Drop, location, HASH_REMOVE, &found);
 						errno = EACCES;
 						break;
 					}
@@ -2432,7 +2527,11 @@ HdfsGetConnection(const char * path)
 				{
 					if (!login())
 					{
-						hash_search(HdfsFsTable, location, HASH_REMOVE, &found);
+						if (!isForDrop)
+							hash_search(HdfsFsTable, location, HASH_REMOVE, &found);
+						else {
+							hash_search(HdfsFsTable4Drop, location, HASH_REMOVE, &found);
+						}
 						errno = EACCES;
 						break;
 					}
@@ -2448,7 +2547,10 @@ HdfsGetConnection(const char * path)
 
 			if (NULL == entry->fs)
 			{
-				hash_search(HdfsFsTable, location, HASH_REMOVE, &found);
+				if (!isForDrop)
+					hash_search(HdfsFsTable, location, HASH_REMOVE, &found);
+				else
+					hash_search(HdfsFsTable4Drop, location, HASH_REMOVE, &found);
 				ereport(LOG,
 						(errcode(ERRCODE_IO_ERROR),
 								errmsg("fail to connect hdfs at %s, errno = %d", location, errno),
@@ -2606,7 +2708,7 @@ HdfsBasicOpenFile(FileName fileName, int fileFlags, int fileMode,
 	if (NULL == ConvertToUnixPath(fileName, path, sizeof(path)))
 		return FALSE;
 
-	tempfs = HdfsGetConnection(fileName);
+	tempfs = HdfsGetConnection(fileName, false);
 	if (tempfs == NULL)
 		return FALSE;
 
@@ -2976,7 +3078,7 @@ HdfsRemovePath(FileName fileName, int recursive)
 	if (HdfsParsePath(fileName, &protocol, NULL, NULL, NULL) || NULL == protocol)
 		return -1;
 
-	hdfsFS fs = HdfsGetConnection(fileName);
+	hdfsFS fs = HdfsGetConnection(fileName, true);
 	if (NULL == fs)
 		return -1;
 	if (NULL == ConvertToUnixPath(fileName, path, sizeof(path)))
@@ -3001,7 +3103,7 @@ HdfsMakeDirectory(const char * path, mode_t mode)
 	if (HdfsParsePath(path, &protocol, NULL, NULL, NULL) || protocol == NULL)
 		return -1;
 
-	hdfsFS fs = HdfsGetConnection(path);
+	hdfsFS fs = HdfsGetConnection(path, false);
 	if (NULL == fs)
 		return -1;
 	if (NULL == ConvertToUnixPath(path, p, sizeof(p)))
@@ -3128,7 +3230,7 @@ HdfsGetDelegationToken(const char *uri, void **fs)
 	char *token;
 	char *retval;
 
-	*fs = HdfsGetConnection(uri);
+	*fs = HdfsGetConnection(uri, false);
 	if (*fs == NULL)
 		return NULL;
 
@@ -3285,7 +3387,7 @@ HdfsPathFileTruncate(FileName fileName) {
 		return -1;
 	}
 
-	fs = HdfsGetConnection(fileName);
+	fs = HdfsGetConnection(fileName, true);
 	if (fs == NULL)
 		return -1;
 
@@ -3338,7 +3440,7 @@ HdfsPathExist(char *path)
 	if (HdfsParsePath(path, &protocol, NULL, NULL, NULL) || NULL == protocol)
 		elog(ERROR, "cannot get protocol for path: %s", path);
 
-	fs = HdfsGetConnection(path);
+	fs = HdfsGetConnection(path, false);
 
 	if (fs == NULL)
 		return false;
@@ -3349,8 +3451,25 @@ HdfsPathExist(char *path)
 	return 0 == hdfsExists(fs, relative_path);
 }
 
+/*
+ * check path is a trash directory
+ * path, e.g: /hawq_default/.Trash
+ */
+static int 
+isTrashDirectory(const char *path) 
+{
+  if (path == NULL)
+    return 0;
+  size_t len = strlen(TRASH_DIRECTORY_NAME);
+  size_t path_len = strlen(path);
+  if (path_len <= len)
+    return 0;
+
+  return strncmp(path+path_len-len, TRASH_DIRECTORY_NAME, len+1) == 0;
+}
+
 bool
-HdfsPathExistAndNonEmpty(char *path, bool *existed)
+HdfsPathExistAndNonEmpty(char *path, bool *existed, bool skip_trash)
 {
   char  relative_path[MAXPGPATH + 1];
   char   *protocol;
@@ -3363,7 +3482,7 @@ HdfsPathExistAndNonEmpty(char *path, bool *existed)
   if (HdfsParsePath(path, &protocol, NULL, NULL, NULL) || NULL == protocol)
     elog(ERROR, "cannot get protocol for path: %s", path);
 
-  fs = HdfsGetConnection(path);
+  fs = HdfsGetConnection(path, false);
 
   if (fs == NULL)
     return false;
@@ -3381,7 +3500,9 @@ HdfsPathExistAndNonEmpty(char *path, bool *existed)
     int num;
     hdfsFileInfo  *fi = hdfsListDirectory(fs, relative_path, &num);
     *existed = true;
-    if (NULL == fi || 0 != num)
+    if (NULL == fi || num > 1 ||
+      (skip_trash && num == 1 && !isTrashDirectory(fi[0].mName)) /* skip Trash directory */
+      )
     {
       return true;
     }
@@ -3446,7 +3567,7 @@ HdfsPathSize(const char *path)
     return 0;
   if (ConvertToUnixPath(path, unixpath, sizeof(unixpath)) == NULL)
     return 0;
-  if ((fs = HdfsGetConnection(path)) == NULL)
+  if ((fs = HdfsGetConnection(path, false)) == NULL)
     return 0;
 
   total_size = HdfsPathSizeRecursive(fs, protocol, unixpath);
@@ -3469,7 +3590,7 @@ HdfsGetFileLength(char * path)
 	if (HdfsParsePath(path, &protocol, NULL, NULL, NULL) || NULL == protocol)
 		elog(ERROR, "cannot get protocol for path: %s", path);
 
-	fs = HdfsGetConnection(path);
+	fs = HdfsGetConnection(path, false);
 
 	if (fs == NULL)
 		return -1;
@@ -3506,7 +3627,7 @@ int HdfsIsDirOrFile(char * path)
 	if (HdfsParsePath(path, &protocol, NULL, NULL, NULL) || NULL == protocol)
 		elog(ERROR, "cannot get protocol for path: %s", path);
 
-	fs = HdfsGetConnection(path);
+	fs = HdfsGetConnection(path, false);
 
 	if (fs == NULL)
 		return -1;
@@ -3552,7 +3673,7 @@ HdfsGetFileBlockLocations2(const char *path, int64 offset, int64 length, int *bl
 		elog(ERROR, "cannot get protocol for path: %s", path);
 	}
 
-	fs = HdfsGetConnection(path);
+	fs = HdfsGetConnection(path, false);
 
 	if (NULL == fs)
 	{
@@ -3576,4 +3697,97 @@ BlockLocation *
 HdfsGetFileBlockLocations(const char *path, int64 length, int *block_num)
 {
     return HdfsGetFileBlockLocations2(path, 0, length, block_num);
+}
+
+/*
+ *  TDE UDF
+ *
+ *  User is able to check if HAWQ filespace is TDE encrypted.
+ */
+extern Datum gp_is_filespace_encrypted(PG_FUNCTION_ARGS) {
+    char * filespace_name = NULL;
+    hdfsFS fs = NULL;
+    hdfsEncryptionZoneInfo *enInfo = NULL;
+    bool encryptedTag = false;
+    int MAX_LENGTH = 1024;
+
+    HeapTuple tuple;
+    cqContext *pcqCtx;
+    Oid oid;
+    char * path = NULL;
+
+    char *host = NULL, *protocol = NULL;
+    int port = 0, pathLen = 0;
+
+    filespace_name = PG_GETARG_CSTRING(0);
+    if (filespace_name == NULL || strlen(filespace_name) > MAX_LENGTH)
+        elog(ERROR, "Input of filespace name is illegal.");
+    else if (strcmp(filespace_name, "") == 0)
+        elog(INFO, "Please input the filespace name you want to check.");
+
+    /* Scan the pg_filespace table to get the corresponding oid. */
+    pcqCtx = caql_beginscan(NULL,
+            cql("SELECT oid FROM pg_filespace WHERE fsname = :1 ",
+            CStringGetDatum(filespace_name)));
+    tuple = caql_getnext(pcqCtx);
+    if (!HeapTupleIsValid(tuple))
+        elog(ERROR, "cache look up failed for pg_filsespace %s", filespace_name);
+    oid = HeapTupleHeaderGetOid(tuple->t_data);
+    caql_endscan(pcqCtx);
+
+    /* Scan the pg_filespace_entry to get the filespace entry. */
+    path = caql_getcstring(NULL,
+                    cql("SELECT fselocation FROM pg_filespace_entry WHERE fsefsoid = :1 ",
+                    ObjectIdGetDatum(oid)));
+    if (path == NULL)
+        elog(ERROR, "cache look up failed for pg_filespace_entry");
+
+    /* Connect to hdfs and parse the filespace entry to get the correct path. */
+    fs = HdfsGetConnection(path, false);
+    if (fs == NULL)
+        elog(ERROR, "Connect to hdfs failed, the path is %s", path);
+    else {
+        if (HdfsParsePath(path, &protocol, &host, &port, NULL)
+                || protocol == NULL || host == NULL || port < 0) {
+            if (protocol)
+                pfree(protocol);
+            if (host)
+                pfree(host);
+            elog(ERROR, "Parse hdfs path of %s failed.", path);
+        }
+        else {
+
+            /* The normal path is like "<protocol>://<host>:<port>/<directory>".
+             * If port is not null, there will be 4 characters to be added which is "://:".
+             * If port is null, there will be 3 characters to be added which is "://".
+             */
+            if (port > 0) {
+                char sPort[strlen(path)];
+                sprintf(sPort, "%d", port);
+                pathLen = strlen(protocol) + strlen(host) + strlen(sPort) + 4;
+            } else if (port == 0) {
+                pathLen = strlen(protocol) + strlen(host) + 3;
+            }
+            elog(DEBUG1, "The path of the hdfs is %s. The protocol is %s. The host is %s. The port is %d",
+                    path, protocol, host, port);
+            
+            pfree(protocol);
+            pfree(host);
+        }
+    }
+    if ((strlen(path) - pathLen) <= 0)
+        elog(ERROR, "Wrong length parsed from hdfs path %s.", path);
+    char enPath[strlen(path) - pathLen + 1];
+    strncpy(enPath, path + pathLen, strlen(path) - pathLen);
+    elog(DEBUG1, "The filespace entry to be check is %s", enPath);
+    pfree(path);
+    /* Check whether the path is encrypted or not. */
+    enInfo = hdfsGetEZForPath(fs, enPath);
+
+    if (enInfo != NULL) {
+        encryptedTag = true;
+        hdfsFreeEncryptionZoneInfo(enInfo, 1);
+    }
+
+    PG_RETURN_BOOL(encryptedTag);
 }

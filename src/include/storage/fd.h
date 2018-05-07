@@ -113,6 +113,7 @@ extern char *DeserializeDelegationToken(void *binary, int size);
 
 extern void cleanup_lru_opened_files(void);
 extern void cleanup_filesystem_handler(void);
+extern void cleanup_hdfs_handlers_for_dropping(void);
 
 /* abstract file system */
 extern File FileNameOpenFile(FileName fileName, const char *temp_dir, int fileFlags, int fileMode);
@@ -183,7 +184,11 @@ extern size_t GetTempFilePrefix(char * buf, size_t buflen, const char * fileName
 extern bool TestFileValid(File file);
 
 extern bool HdfsPathExist(char *path);
-extern bool HdfsPathExistAndNonEmpty(char *path, bool *existed);
+
+/* hdfs trash direcotry name */
+#define TRASH_DIRECTORY_NAME ".Trash"
+
+extern bool HdfsPathExistAndNonEmpty(char *path, bool *existed, bool skip_trash);
 
 extern int64 HdfsPathSize(const char *path);
 

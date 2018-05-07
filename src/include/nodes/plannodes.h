@@ -339,6 +339,9 @@ typedef struct Plan
 
 	/* MemoryAccount to use for recording the memory usage of different plan nodes. */
 	MemoryAccount* memoryAccount;
+
+	/* if the plan can be vectorized */
+	bool vectorized;
 } Plan;
 
 /* ----------------
@@ -820,6 +823,8 @@ typedef struct HashJoin
 	Join		join;
 	List	   *hashclauses;
 	List	   *hashqualclauses;
+	bool		useRuntimeFilter;
+	int 		estimatedInnerNum;
 } HashJoin;
 
 /*

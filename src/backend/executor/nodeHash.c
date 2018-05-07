@@ -56,7 +56,7 @@
 #include "utils/lsyscache.h"
 #include "utils/debugbreak.h"
 #include "utils/faultinjector.h"
-
+#include "resourcemanager/utils/simplestring.h"
 #include "cdb/cdbexplain.h"
 #include "cdb/cdbvars.h"
 
@@ -76,8 +76,6 @@ void ExecChooseHashTableSize(double ntuples, int tupwidth,
 						int *numbatches,
 						uint64 operatorMemKB
 						);
-
-#define BLOOMVAL(hk)  (((uint64)1) << (((hk) >> 13) & 0x3f))
 
 /* Amount of metadata memory required per batch */
 #define MD_MEM_PER_BATCH 	(sizeof(HashJoinBatchData *) + sizeof(HashJoinBatchData))
@@ -157,6 +155,12 @@ MultiExecHash(HashState *node)
 		if (ExecHashGetHashValue(node, hashtable, econtext, hashkeys, node->hs_keepnull, &hashvalue, &hashkeys_null))
 		{
 			ExecHashTableInsert(node, hashtable, slot, hashvalue);
+			/* Insert hash values into Bloom filter */
+			if (node->hashtable->bloomfilter != NULL && node->hashtable->bloomfilter->isCreated)
+			{
+				InsertBloomFilter(node->hashtable->bloomfilter, hashvalue);
+				node->hashtable->bloomfilter->nInserted++;
+			}
 		}
 
 		if (hashkeys_null)
@@ -323,7 +327,7 @@ ExecHashTableCreate(HashState *hashState, HashJoinState *hjstate, List *hashOper
 	 */
 	hashtable = (HashJoinTable)palloc0(sizeof(HashJoinTableData));
 	hashtable->buckets = NULL;
-	hashtable->bloom = NULL;
+	hashtable->bloomfilter = NULL;
 	hashtable->curbatch = 0;
 	hashtable->growEnabled = true;
 	hashtable->totalTuples = 0;
@@ -350,6 +354,15 @@ ExecHashTableCreate(HashState *hashState, HashJoinState *hjstate, List *hashOper
 												ALLOCSET_DEFAULT_MINSIZE,
 												ALLOCSET_DEFAULT_INITSIZE,
 												ALLOCSET_DEFAULT_MAXSIZE);
+
+	if (hjstate->useRuntimeFilter)
+	{
+		hashtable->bloomfilterCtx = AllocSetContextCreate(hashtable->hashCxt,
+													"HashTableBloomFilterContext",
+													ALLOCSET_DEFAULT_MINSIZE,
+													ALLOCSET_DEFAULT_INITSIZE,
+													ALLOCSET_DEFAULT_MAXSIZE);
+	}
 
 	/* CDB */ /* track temp buf file allocations in separate context */
 	hashtable->bfCxt = AllocSetContextCreate(CurrentMemoryContext,
@@ -455,10 +468,31 @@ ExecHashTableCreate(HashState *hashState, HashJoinState *hjstate, List *hashOper
 	hashtable->buckets = (HashJoinTuple *)
 		palloc0(nbuckets * sizeof(HashJoinTuple));
 
-	if(gp_hashjoin_bloomfilter!=0)
-		hashtable->bloom = (uint64*) palloc0(nbuckets * sizeof(uint64));
-
 	MemoryContextSwitchTo(oldcxt);
+
+
+	/*
+	 * Initialize Bloom filter
+	 */
+	if (hjstate->useRuntimeFilter)
+	{
+		/*
+		 * The size of Bloom filter is decided by the estimated number of
+		 * tuples from inner table, but won't exceed the GUC value
+		 */
+		MemoryContextSwitchTo(hashtable->bloomfilterCtx);
+		SimpString valuestr;
+		setSimpleStringRef(&valuestr,
+				hawq_hashjoin_bloomfilter_max_memory_size, strlen(hawq_hashjoin_bloomfilter_max_memory_size));
+		uint64_t max_size = 0;
+		SimpleStringToBytes(&valuestr, &max_size);
+		max_size = UpperPowerTwo(max_size);
+
+		int size = UpperPowerTwo(hjstate->estimatedInnerNum);
+		hashtable->bloomfilter = InitBloomFilter(min(size, max_size));
+		MemoryContextSwitchTo(oldcxt);
+	}
+
 	}
 	END_MEMORY_ACCOUNT();
 	return hashtable;
@@ -722,7 +756,10 @@ ExecHashTableDestroy(HashState *hashState, HashJoinTable hashtable)
 		hashtable->work_set = NULL;
 	}
 
-	/* Release working memory (batchCxt is a child, so it goes away too) */
+	/*
+	 * Release working memory (batchCxt and bloomfilterCxt are children,
+	 * so they go away too)
+	 */
 	MemoryContextDelete(hashtable->hashCxt);
 	hashtable->batches = NULL;
 	}
@@ -792,7 +829,6 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 	{
 		HashJoinTuple prevtuple;
 		HashJoinTuple tuple;
-		uint64 bloom = 0;
 
 		prevtuple = NULL;
 		tuple = hashtable->buckets[i];
@@ -812,7 +848,6 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 			{
 				/* keep tuple */
 				prevtuple = tuple;
-				bloom |= BLOOMVAL(tuple->hashvalue);
 			}
 			else
 			{
@@ -846,9 +881,6 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 
 			tuple = nexttuple;
 		}
-
-		if(gp_hashjoin_bloomfilter!=0)
-			hashtable->bloom[i] = bloom;
 	}
 
 #ifdef HJDEBUG
@@ -988,9 +1020,6 @@ ExecHashTableInsert(HashState *hashState, HashJoinTable hashtable,
 		hashTuple->next = hashtable->buckets[bucketno];
 		hashtable->buckets[bucketno] = hashTuple;
 		hashtable->totalTuples += 1;
-
-		if(gp_hashjoin_bloomfilter!=0)
-			hashtable->bloom[bucketno] |= BLOOMVAL(hashvalue);
 
 		/* Double the number of batches when too much data in hash table. */
 		if (batch->innerspace > hashtable->spaceAllowed ||
@@ -1195,12 +1224,12 @@ ExecScanHashBucket(HashState *hashState, HashJoinState *hjstate,
 	 */
 	if (hashTuple == NULL)
 	{
-		/* if bloom filter fails, then no match - don't even bother to scan */
-		if (gp_hashjoin_bloomfilter == 0 || 0 != (hashtable->bloom[hjstate->hj_CurBucketNo] & BLOOMVAL(hashvalue)))
-			hashTuple = hashtable->buckets[hjstate->hj_CurBucketNo];
+		hashTuple = hashtable->buckets[hjstate->hj_CurBucketNo];
 	}
 	else
+	{
 		hashTuple = hashTuple->next;
+	}
 
 	while (hashTuple != NULL)
 	{
@@ -1262,9 +1291,6 @@ ExecHashTableReset(HashState *hashState, HashJoinTable hashtable)
 	/* Reallocate and reinitialize the hash bucket headers. */
 	hashtable->buckets = (HashJoinTuple *)
 		palloc0(nbuckets * sizeof(HashJoinTuple));
-
-	if(gp_hashjoin_bloomfilter != 0)
-		hashtable->bloom = (uint64*) palloc0(nbuckets * sizeof(uint64));
 
 	hashtable->batches[hashtable->curbatch]->innerspace = 0;
 	hashtable->batches[hashtable->curbatch]->innertuples = 0;

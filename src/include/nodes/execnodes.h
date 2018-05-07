@@ -45,7 +45,7 @@
 #include "utils/relcache.h"
 #include "gpmon/gpmon.h"                /* gpmon_packet_t */
 #include "utils/memaccounting.h"
-
+#include "utils/bloomfilter.h"
 
 /*
  * Currently, since grouping is defined as uint64 internally, it limits the
@@ -1293,6 +1293,9 @@ typedef struct PlanState
          */
         int gpmon_plan_tick;
         gpmon_packet_t gpmon_pkt;
+
+        /* state of executor operator  */
+        void* vectorized;
 } PlanState;
 
 typedef struct Gpmon_NameUnit_MaxVal
@@ -1846,6 +1849,7 @@ typedef struct ExternalScanState
 	struct FileScanDescData *ess_ScanDesc;
 	bool cdb_want_ctid;
 	ItemPointerData cdb_fake_ctid;
+	int parent_agg_type;
 } ExternalScanState;
 
 /* ----------------
@@ -2113,6 +2117,8 @@ typedef struct HashJoinState
         bool workfiles_created;
         /* number of batches when we loaded from the state. -1 means not loaded yet */
         int nbatch_loaded_state;
+        bool useRuntimeFilter;
+        int  estimatedInnerNum;
 
 } HashJoinState;
 

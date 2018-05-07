@@ -21,6 +21,7 @@ package org.apache.hawq.ranger.service;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hawq.ranger.model.HawqProtocols;
+import org.apache.ranger.plugin.client.BaseClient;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -29,9 +30,10 @@ import java.sql.SQLException;
 import java.sql.ResultSet;
 import java.util.*;
 
-import static org.apache.ranger.plugin.client.BaseClient.generateResponseDataMap;
+import org.apache.ranger.audit.utils.InMemoryJAASConfiguration;
 
-public class HawqClient {
+
+public class HawqClient extends BaseClient {
 
     private static final Log LOG = LogFactory.getLog(HawqClient.class);
 
@@ -63,12 +65,14 @@ public class HawqClient {
     public static final String PRONAME = "proname";
     public static final String NSPNAME = "nspname";
     public static final String WILDCARD = "*";
+    public static final String KERBEROS = "kerberos";
+    public static final String AUTHENTICATION = "authentication";
 
     public static final List<String> INTERNAL_PROTOCOLS = HawqProtocols.getAllProtocols();
     private static final String DEFAULT_DATABASE = "postgres";
+    private static final String DEFAULT_DATABASE_TEMPLATE = "DBTOBEREPLACEDINJDBCURL";
     private static final String JDBC_DRIVER_CLASS = "org.postgresql.Driver";
-
-    private Map<String, String> connectionProperties;
+    private static final String JAAS_APPLICATION_NAME = "pgjdbc";
 
     // we need to load class for the Postgres Driver directly to allow it to register with DriverManager
     // since DriverManager's classloader will not be able to find it by itself due to plugin's special classloaders
@@ -81,9 +85,83 @@ public class HawqClient {
         }
     }
 
-    public HawqClient(Map<String, String> connectionProperties) throws SQLException {
+    public HawqClient(String serviceName, Map<String, String> connectionProperties) throws Exception {
+        super(serviceName, connectionProperties);
         this.connectionProperties = connectionProperties;
     }
+
+    /**
+     * clone a new Properties for debug logging:
+     *  1. remove all password fields for preventing plain password leak in log
+     *  2. add _password_length fields for debug
+     *
+     * @param connectionProperties
+     * @return a new cloned Map for debug logging
+     */
+    private Map<String, String> removePassword(Map<String, String> connectionProperties) {
+        Map<String, String> new_property = new HashMap<String, String>(connectionProperties);
+
+        String pass_fields[] = {"password", "password_jdbc"};
+        for (int i = 0; i < pass_fields.length; i++) {
+            String field = pass_fields[i];
+            if (new_property.containsKey(field)) {
+                String password = new_property.get(field);
+                new_property.remove(field);
+                new_property.put("_"+field+"_length", Integer.toString(password.length()));
+            }
+        }
+
+        return new_property;
+    }
+
+    private Connection getConnection(Map<String, String> connectionProperties) throws SQLException {
+        return getConnection(connectionProperties, null);
+    }
+
+    private Connection getConnection(Map<String, String> connectionProperties, String database) throws SQLException {
+
+        String db = database != null ? database : DEFAULT_DATABASE;
+        Properties props = new Properties();
+
+        if (LOG.isDebugEnabled()) {
+            Map<String, String> debugProperties = removePassword(connectionProperties);
+            LOG.debug("<== HawqClient.checkConnection configuration" + debugProperties );
+        }
+
+        if (connectionProperties.containsKey(AUTHENTICATION) && connectionProperties.get(AUTHENTICATION).equals(KERBEROS)) {
+
+            Properties props_jaas = new Properties();
+            props_jaas.put("xasecure.audit.jaas."+ JAAS_APPLICATION_NAME +".loginModuleName", "com.sun.security.auth.module.Krb5LoginModule");
+            props_jaas.put("xasecure.audit.jaas."+ JAAS_APPLICATION_NAME +".loginModuleControlFlag", "required");
+
+            try {
+                InMemoryJAASConfiguration.init(props_jaas);
+            } catch (Exception e) {
+                LOG.error("InMemoryJAASConfiguration failed: " + e.getMessage());
+                e.printStackTrace();
+            }
+
+            //kerberos mode
+            props.setProperty("kerberosServerName", connectionProperties.get("principal"));
+            props.setProperty("jaasApplicationName", JAAS_APPLICATION_NAME);
+
+        }
+
+        String password = connectionProperties.get("password");
+        if (connectionProperties.containsKey("password_jdbc"))
+            password = connectionProperties.get("password_jdbc");
+
+        String url = String.format("jdbc:postgresql://%s:%s/%s", connectionProperties.get("hostname"), connectionProperties.get("port"), db);
+        props.setProperty("user", connectionProperties.get("username"));
+        props.setProperty("password", password);
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("<== HawqClient.checkConnection Connecting to: (" + url + ") with user: " + connectionProperties.get("username"));
+        }
+
+        return DriverManager.getConnection(url, props);
+    }
+
 
     /**
      * Uses the connectionProperties and attempts to connect to Hawq.
@@ -97,7 +175,6 @@ public class HawqClient {
 
         boolean isConnected = false;
         HashMap<String, Object> result = new HashMap<>();
-        Connection conn = null;
 
         String description = CONNECTION_FAILURE_MESSAGE;
 
@@ -105,9 +182,10 @@ public class HawqClient {
             LOG.debug("<== HawqClient.checkConnection Starting connection to hawq");
         }
 
+        Connection conn = null;
         try {
             conn = getConnection(connectionProperties);
-            if(conn.getCatalog() != null) {
+            if (conn.getCatalog() != null) {
                 isConnected = true;
                 description = CONNECTION_SUCCESSFUL_MESSAGE;
             }
@@ -119,7 +197,6 @@ public class HawqClient {
         }
 
         String message = isConnected ? CONNECTION_SUCCESSFUL_MESSAGE : CONNECTION_FAILURE_MESSAGE;
-
         generateResponseDataMap(isConnected, message, description, null, null, result);
 
         return result;
@@ -136,7 +213,7 @@ public class HawqClient {
     public List<String> getProtocolList(String userInput) throws SQLException {
         Set<String> allProtocols = new HashSet<>();
         for (String protocol : INTERNAL_PROTOCOLS) {
-            if(protocol.startsWith(userInput) || userInput.equals(WILDCARD)) {
+            if (protocol.startsWith(userInput) || userInput.equals(WILDCARD)) {
                 allProtocols.add(protocol);
             }
         }
@@ -148,7 +225,7 @@ public class HawqClient {
         return queryHawqPerDb(userInput, resources.get("database"), SCHEMA_NAME, SCHEMA_LIST_QUERY);
     }
 
-    public List<String> getLanguageList(String userInput,  Map<String, List<String>> resources) throws SQLException {
+    public List<String> getLanguageList(String userInput, Map<String, List<String>> resources) throws SQLException {
         return queryHawqPerDb(userInput, resources.get("database"), LANGUAGE_NAME, LANGUAGE_LIST_QUERY);
     }
 
@@ -183,15 +260,16 @@ public class HawqClient {
         List<String> databases = resources.get("database");
         List<String> schemas = resources.get("schema");
 
-        Connection conn = null;
         PreparedStatement preparedStatement = null;
         ResultSet resultSet = null;
+        Connection conn = null;
 
         if (databases.contains(WILDCARD)) {
             databases = getDatabaseList(WILDCARD);
         }
 
-        for (String db: databases) {
+        for (String db : databases) {
+
             if (LOG.isDebugEnabled()) {
                 LOG.debug("<== HawqClient.queryHawqPerDbAndSchema: Connecting to db: " + db);
             }
@@ -201,13 +279,12 @@ public class HawqClient {
                 preparedStatement = handleWildcardPreparedStatement(userInput, query, conn);
 
                 if (LOG.isDebugEnabled()) {
-                    LOG.debug("<== HawqClient.queryHawqPerDbAndSchema Starting query: " + query);
+                    LOG.debug("<== HawqClient.queryHawqPerDbAndSchema Starting query: " + preparedStatement.toString());
                 }
 
                 resultSet = preparedStatement.executeQuery();
-
-                while(resultSet.next()) {
-                    if(schemas.contains(resultSet.getString(schemaColumnName)) || schemas.contains(WILDCARD)) {
+                while (resultSet.next()) {
+                    if (schemas.contains(resultSet.getString(schemaColumnName)) || schemas.contains(WILDCARD)) {
                         uniqueResults.add(resultSet.getString(resultColumnName));
                     }
                 }
@@ -223,27 +300,28 @@ public class HawqClient {
                 closeStatement(preparedStatement);
                 closeConnection(conn);
             }
+
         }
         return new ArrayList<>(uniqueResults);
     }
 
-    private List<String> queryHawq(String userInput, String columnName, String query, String database) {
+    private List<String> queryHawq(String userInput, String columnName, String query, String database) throws SQLException {
         List<String> result = new ArrayList<>();
-        Connection conn = null;
         PreparedStatement preparedStatement = null;
         ResultSet resultSet = null;
+        Connection conn = null;
 
         try {
             conn = getConnection(connectionProperties, database);
             preparedStatement = handleWildcardPreparedStatement(userInput, query, conn);
 
             if (LOG.isDebugEnabled()) {
-                LOG.debug("<== HawqClient.queryHawq Starting query: " + query);
+                LOG.debug("<== HawqClient.queryHawq Starting query: " + preparedStatement.toString());
             }
 
             resultSet = preparedStatement.executeQuery();
 
-            while(resultSet.next()) {
+            while (resultSet.next()) {
                 result.add(resultSet.getString(columnName));
             }
 
@@ -253,6 +331,7 @@ public class HawqClient {
 
         } catch (SQLException e) {
             LOG.error("<== HawqClient.queryHawq Error: Failed to get result from query: " + query + ", Error: " + e);
+            throw e;
         } finally {
             closeResultSet(resultSet);
             closeStatement(preparedStatement);
@@ -260,25 +339,6 @@ public class HawqClient {
         }
 
         return result;
-    }
-
-    private Connection getConnection(Map<String, String> connectionProperties) throws SQLException {
-        return getConnection(connectionProperties, null);
-    }
-
-    private Connection getConnection(Map<String, String> connectionProperties, String database) throws SQLException {
-
-        String db = database != null ? database : DEFAULT_DATABASE;
-        String url = String.format("jdbc:postgresql://%s:%s/%s", connectionProperties.get("hostname"), connectionProperties.get("port"), db);
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("<== HawqClient.checkConnection Connecting to: (" + url + ") with user: " + connectionProperties.get("username") );
-        }
-
-        Properties props = new Properties();
-        props.setProperty("user", connectionProperties.get("username"));
-        props.setProperty("password", connectionProperties.get("password"));
-        return DriverManager.getConnection(url, props);
     }
 
     private PreparedStatement handleWildcardPreparedStatement(String userInput, String query, Connection conn) throws SQLException {
@@ -305,7 +365,9 @@ public class HawqClient {
 
     private void closeConnection(Connection conn) {
         try {
-            if (conn != null) conn.close();
+            if (conn != null) {
+                conn.close();
+            }
         } catch (Exception e) {
             // ignore
         }

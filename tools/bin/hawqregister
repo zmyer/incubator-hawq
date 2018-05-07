@@ -37,7 +37,12 @@ except ImportError, e:
 # setup logging
 logger = get_default_logger()
 EXECNAME = os.path.split(__file__)[-1]
-setup_tool_logging(EXECNAME, getLocalHostname(), getUserName())
+
+# print executing command
+cmd = "Executing Command: ";
+for arg in sys.argv:
+    cmd += arg + " "
+logger.info(cmd);
 
 def option_parser():
     '''option parser'''
@@ -54,6 +59,7 @@ def option_parser():
     parser.add_option('-e', '--eof', dest='filesize', type='int', default=None, help='eof of the file to be registered')
     parser.add_option('-c', '--config', dest='yml_config', default='', help='configuration file in YAML format')
     parser.add_option('-F', '--force', dest='force', action='store_true', default=False)
+    parser.add_option('-l', '--logdir', dest='logDir', help="Sets the directory for log files")
     return parser
 
 
@@ -829,13 +835,13 @@ class HawqRegister(object):
     def _check_parquet_format(self, files):
         '''Check whether the file to be registered is parquet format'''
         for f in files:
-            hdfscmd = 'hadoop fs -du -h %s | head -c 1' % f
+            hdfscmd = 'hadoop fs -du -h %s | head -c1' % f
             rc, out, err = local_ssh_output(hdfscmd)
             if out == '0':
                 continue
-            hdfscmd = 'hadoop fs -cat %s | head -c 4 | grep PAR1' % f
+            hdfscmd = 'hadoop fs -cat %s | head -c4 | grep PAR1' % f
             result1 = local_ssh(hdfscmd)
-            hdfscmd = 'hadoop fs -cat %s | tail -c 4 | grep PAR1' % f
+            hdfscmd = 'hadoop fs -cat %s | tail -c4 | grep PAR1' % f
             result2 = local_ssh(hdfscmd)
             if result1 or result2:
                 logger.error('File %s is not parquet format' % f)
@@ -1192,6 +1198,7 @@ def test(options, args):
 if __name__ == '__main__':
     parser = option_parser()
     options, args = parser.parse_args()
+    setup_tool_logging(EXECNAME, getLocalHostname(), getUserName(), logdir=options.logDir)
     if len(args) != 1:
         parser.print_help(sys.stderr)
         sys.exit(1)

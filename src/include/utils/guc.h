@@ -412,6 +412,7 @@ extern double optimizer_nestloop_factor;
 extern double locality_upper_bound;
 extern bool optimizer_cte_inlining;
 extern double net_disk_ratio;
+extern double hawq_hashjoin_bloomfilter_ratio;
 extern int optimizer_cte_inlining_bound;
 extern double optimizer_damping_factor_filter;
 extern double optimizer_damping_factor_join;
@@ -444,6 +445,8 @@ extern bool optimizer_prefer_scalar_dqa_multistage_agg;
 extern bool optimizer_parallel_union;
 extern bool optimizer_array_constraints;
 
+/* Timeout for shareinputscan writer/reader wait for lock files */
+extern int share_input_scan_wait_lockfile_timeout;
 
 /* fallback in ranger ACL check */
 extern int information_schema_namespace_oid;
@@ -457,12 +460,11 @@ extern bool	optimizer_partition_selection_log;
 /* acl type for privileges check */
 extern char   *acl_type;
 
-/**
- * rps host and port
- */
-extern char   *rps_addr_host;
-extern char   *rps_addr_suffix;
+/* rps port*/
 extern int     rps_addr_port;
+
+/* interval of checking local RPS */
+extern int     rps_check_local_interval;
 /*
  * During insertion in a table with parquet partitions,
  * require tuples to be sorted by partition key.

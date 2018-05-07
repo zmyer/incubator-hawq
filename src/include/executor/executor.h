@@ -41,6 +41,20 @@
 
 #include "cdb/cdbdef.h"                 /* CdbVisitOpt */
 
+typedef struct vectorexe_t {
+	bool vectorized_executor_enable;
+	Plan* (*CheckPlanVectorized_Hook)(PlannerInfo *node, Plan *plan);
+	ExprState* (*ExecInitExpr_Hook)(Expr *node, PlanState *parent);
+	PlanState* (*ExecInitNode_Hook)(Plan *node, EState *eState,int eflags);
+	PlanState* (*ExecVecNode_Hook)(PlanState *Node, PlanState *parentNode, EState *eState,int eflags);
+	bool (*ExecProcNode_Hook)(PlanState *node,TupleTableSlot** pRtr);
+	bool (*ExecEndNode_Hook)(PlanState *node);
+	Oid (*GetNType)(Oid vtype);
+} VectorExecMthd;
+
+extern PGDLLIMPORT VectorExecMthd vmthd;
+
+
 struct ChunkTransportState;             /* #include "cdb/cdbinterconnect.h" */
 
 /*
@@ -71,6 +85,8 @@ struct ChunkTransportState;             /* #include "cdb/cdbinterconnect.h" */
 #define EXEC_FLAG_REWIND		0x0002	/* expect rescan */
 #define EXEC_FLAG_BACKWARD		0x0004	/* need backward scan */
 #define EXEC_FLAG_MARK			0x0008	/* need mark/restore */
+
+#define EXEC_FLAG_EXTERNAL_AGG_COUNT  0x0010	/* can support external agg */
 
 
 /*

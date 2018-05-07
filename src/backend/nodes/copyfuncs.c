@@ -145,6 +145,7 @@ CopyPlanFields(Plan *from, Plan *newnode)
 	COPY_SCALAR_FIELD(directDispatch.isDirectDispatch);
 	COPY_NODE_FIELD(directDispatch.contentIds);
 	COPY_SCALAR_FIELD(operatorMemKB);
+	COPY_SCALAR_FIELD(vectorized);
 
 }
 
@@ -4219,6 +4220,7 @@ _copyFileSplitNode(FileSplitNode *from)
   COPY_SCALAR_FIELD(logiceof);
   COPY_SCALAR_FIELD(offsets);
   COPY_SCALAR_FIELD(lengths);
+  COPY_STRING_FIELD(ext_file_uri_string);
 
   return newnode;
 }

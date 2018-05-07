@@ -68,6 +68,7 @@ class HawqInit:
         self.max_connections = opts.max_connections
         self.shared_buffers = opts.shared_buffers
         self.default_hash_table_bucket_number = opts.default_hash_table_bucket_number
+        self.tde_keyname= opts.tde_keyname
         self.lock = threading.Lock()
         self.ignore_bad_hosts = opts.ignore_bad_hosts
         self._get_config()
@@ -170,11 +171,21 @@ class HawqInit:
             local_ssh(cmd, logger)
 
     def check_hdfs_path(self):
-        cmd = "%s/bin/gpcheckhdfs hdfs %s %s %s %s" % \
-              (self.GPHOME, self.dfs_url, self.enable_secure_filesystem, self.krb_srvname, self.krb_server_keyfile)
+        if self.tde_keyname:
+            cmd = "%s/bin/gpcheckhdfs hdfs %s %s %s %s --with-tde %s" % \
+              (self.GPHOME, self.dfs_url, self.enable_secure_filesystem, \
+               self.krb_srvname, self.krb_server_keyfile, self.tde_keyname)
+        else:
+            cmd = "%s/bin/gpcheckhdfs hdfs %s %s %s %s" % \
+              (self.GPHOME, self.dfs_url, self.enable_secure_filesystem, \
+               self.krb_srvname, self.krb_server_keyfile)
+
         logger.info("Check if hdfs path is available")
         logger.debug("Check hdfs: %s" % cmd)
         check_return_code(local_ssh(cmd, logger, warning = True), logger, "Check hdfs failed, please verify your hdfs settings")
+        if self.tde_keyname:
+            logger.info("Create encryption zone successfully, key_name:%s" % (self.tde_keyname))
+
 
     def set_new_standby_host(self):
         if self.new_standby_hostname == self.master_host_name:
@@ -387,6 +398,12 @@ class HawqInit:
                  (self.GPHOME, self.standby_host_name, self.GPHOME)
         check_return_code(remote_ssh(scpcmd, self.master_host_name, self.user), \
                           logger, "Sync slaves file failed")
+        # Sync rps configuration
+        if os.path.exists("%s/ranger/" % (self.GPHOME)):
+            scpcmd = "scp %s/ranger/etc/* %s:%s/ranger/etc/ > /dev/null" % \
+                 (self.GPHOME, self.standby_host_name, self.GPHOME)
+            check_return_code(remote_ssh(scpcmd, self.master_host_name, self.user), \
+                          logger, "Sync rps configuration files failed")
 
         standby_init_cmd = self._get_standby_init_cmd()
 
@@ -394,7 +411,7 @@ class HawqInit:
 
     def _resync_standby(self):
         logger.info("Re-sync standby")
-        cmd = "%s; hawq stop master -a;" % source_hawq_env
+        cmd = "%s; hawq stop master -a -M %s;" % (source_hawq_env, self.stop_mode)
         check_return_code(local_ssh(cmd, logger), logger, "Stop hawq cluster failed, exit")
         cmd = "cd %s; %s; %s/bin/lib/pysync.py -x gpperfmon/data -x pg_log -x db_dumps %s %s:%s" % \
                  (self.master_data_directory, source_hawq_env,  self.GPHOME, self.master_data_directory,
@@ -691,8 +708,10 @@ class HawqStart:
         logger.info("Start all the nodes in hawq cluster")
 
         if self.hawq_acl_type == 'ranger':
-            self.start_rps()
+            self.start_rps(self.master_host_name)
         if self.standby_host_name.lower() not in ('', 'none'):
+            if self.hawq_acl_type == 'ranger':
+                self.start_rps(self.standby_host_name)
             logger.info("Starting standby master '%s'" % self.standby_host_name)
             check_return_code(self.start_standby(), logger, "Standby master start failed, exit",
                               "Standby master started successfully")
@@ -737,25 +756,28 @@ class HawqStart:
             logger.info("Segments started successfully")
         return node_init.return_flag
 
-    def _start_rps(self):
-        logger.info("Start ranger plugin service")
+    def _start_rps(self, rps_hostname):
+        logger.info("Start ranger plugin service on %s" % rps_hostname)
         cmd_str = "%s/ranger/bin/rps.sh start" % (self.GPHOME)
-        result = remote_ssh(cmd_str, self.master_host_name, self.user)
+        result = remote_ssh(cmd_str, rps_hostname, self.user)
         return result
 
-    def start_rps(self):
-        check_return_code(self._start_rps(), logger, \
-                          "Ranger plugin service start failed, exit", "Ranger plugin service started successfully")
+    def start_rps(self, rps_hostname):
+        check_return_code(self._start_rps(rps_hostname), logger, \
+                          "Ranger plugin service start on %s failed, exit" % rps_hostname, \
+                          "Ranger plugin service started on %s successfully" % rps_hostname)
 
     def run(self):
         if self.node_type == "master":
             if self.hawq_acl_type == 'ranger':
-                self.start_rps()
+                self.start_rps(self.master_host_name)
             check_return_code(self.start_master(), logger, \
                               "Master start failed, exit", "Master started successfully")
         elif self.node_type == "standby":
             if self.standby_host_name == '':
                 sys.exit(1)
+            if self.hawq_acl_type == 'ranger':
+                self.start_rps(self.standby_host_name)
             check_return_code(self.start_standby(), logger, "Standby master start failed, exit",
                               "Standby master started successfully")
         elif self.node_type == "segment":
@@ -909,9 +931,16 @@ class HawqStop:
                       (source_hawq_env, self.GPHOME, self.segment_data_directory, log_filename)
             return cmd_str
         else:
+            # If stop cluster, firstly master stopped, then segment maybe hung at recv() from master.
+            # So here change segment stop mode from smart to fast, so that segment don't wait
+            # connection from master to be closed.
+            seg_stop_mod = self.stop_mode
+            if(self.node_type == 'cluster' and seg_stop_mod =='smart'):
+                seg_stop_mod = 'fast'
+
             cmd_str = "%s; %s/bin/pg_ctl stop -w -t %s -D %s -l %s/pg_log/startup.log -m %s >> %s" % \
                       (source_hawq_env, self.GPHOME, self.timeout, self.segment_data_directory,
-                       self.segment_data_directory, self.stop_mode, log_filename)
+                       self.segment_data_directory, seg_stop_mod, log_filename)
             return cmd_str
 
     def _stop_segment(self):
@@ -961,11 +990,10 @@ class HawqStop:
                 logger.error("Standby master %s failed" % self.stop_action)
             else:
                 logger.info("Standby master %s successfully" % self.stop_action_past)
-        if self.hawq_acl_type == 'ranger':
-            self.stop_rps()
-        if self.hawq_acl_type == 'unknown':
-            logger.warning("try to stop RPS when hawq_acl_type is unknown")
-            self.stop_rps()
+        if self.hawq_acl_type in ['ranger', 'unknown']:
+            self._stop_rps(self.master_host_name, self.hawq_acl_type)
+            if self.standby_host_name.lower() not in ('', 'none'):
+                self._stop_rps(self.standby_host_name, self.hawq_acl_type)
 
         # Execute segment stop command on each node.
         segments_return_flag = self._stopAllSegments()
@@ -1041,29 +1069,35 @@ class HawqStop:
             logger.info("Segments %s successfully" % self.stop_action_past)
         return total_return_flag
 
-    def _stop_rps(self):
-        cmd_str = "%s/ranger/bin/rps.sh stop" % (self.GPHOME)
-        result = remote_ssh(cmd_str, self.master_host_name, self.user)
-        return result
 
-    def stop_rps(self):
-        logger.info("Stop Ranger plugin service")
-        check_return_code(self._stop_rps(), logger, \
-                          "Ranger plugin service stop failed, exit", "Ranger plugin service stopped successfully")
+    def _stop_rps(self, rps_hostname, acl_type):
+        if self.hawq_reload:
+            # not stop RPS when running 'hawq stop --reload'.
+            return
+        check_ret = True
+        if acl_type == 'unknown':
+            logger.warning("Try to stop RPS when hawq_acl_type is unknown")
+            check_ret = False
+        logger.info("Stop ranger plugin service on %s" % rps_hostname)
+        cmd_str = "%s/ranger/bin/rps.sh stop" % (self.GPHOME)
+        result = remote_ssh(cmd_str, rps_hostname, self.user)
+        if check_ret:
+            check_return_code(result, logger, \
+                          "Ranger plugin service stop failed on %s, exit" % rps_hostname, \
+                          "Ranger plugin service stopped on %s successfully" % rps_hostname)
 
     def run(self):
         if self.node_type == "master":
             check_return_code(self._stop_master(), logger, \
                               "Master %s failed, exit" % self.stop_action, "Master %s successfully" % self.stop_action_past)
-            if self.hawq_acl_type == 'ranger':
-                self.stop_rps()
-            if self.hawq_acl_type == 'unknown':
-                logger.warning("try to stop RPS when hawq_acl_type is unknown")
-                self.stop_rps()
+            if self.hawq_acl_type in ['ranger', 'unknown']:
+                self._stop_rps(self.master_host_name, self.hawq_acl_type)
         elif self.node_type == "standby":
             if self.standby_host_name.lower() not in ('', 'none'):
                 check_return_code(self._stop_standby(), logger, \
                                   "Standby master %s failed, exit" % self.stop_action, "Standby master %s successfully" % self.stop_action_past)
+                if self.hawq_acl_type in ['ranger', 'unknown']:
+                    self._stop_rps(self.standby_host_name, self.hawq_acl_type)
         elif self.node_type == "segment":
             check_return_code(self._stop_segment(), logger, \
                               "Segment %s failed, exit" % self.stop_action, "Segment %s successfully" % self.stop_action_past)
@@ -1406,6 +1440,10 @@ def create_parser():
                       type="int",
                       dest="default_hash_table_bucket_number",
                       help="Sets maximum number of virtual segments per node")
+    parser.add_option("--tde_keyname",
+                      dest="tde_keyname",
+                      default="",
+                      help="Sets the encryption zone key(EZK) name for the hawq directory(hawq_dfs_url)")
     parser.add_option("--locale",
                       dest="hawq_locale",
                       default="en_US.utf8",

@@ -653,12 +653,15 @@ ExecEvalVar(ExprState *exprstate, ExprContext *econtext,
 			/* can't check type if dropped, since atttypid is probably 0 */
 			if (!attr->attisdropped)
 			{
-				if (variable->vartype != attr->atttypid)
+				bool cond = vmthd.GetNType == NULL ?
+							variable->vartype != attr->atttypid :
+							(variable->vartype != attr->atttypid && vmthd.GetNType(variable->vartype) != attr->atttypid);
+				if (cond)
 					ereport(ERROR,
 							(errmsg("attribute %d has wrong type", attnum),
-							 errdetail("Table has type %s, but query expects %s.",
-									   format_type_be(attr->atttypid),
-									   format_type_be(variable->vartype))));
+									errdetail("Table has type %s, but query expects %s.",
+											  format_type_be(attr->atttypid),
+											  format_type_be(variable->vartype))));
 			}
 		}
 
@@ -4512,6 +4515,17 @@ ExecInitExpr(Expr *node, PlanState *parent)
 
 	/* Guard against stack overflow due to overly complex expressions */
 	check_stack_depth();
+
+	/* Initialize the vectorzied expressions */
+	if( vmthd.vectorized_executor_enable
+		&& vmthd.ExecInitExpr_Hook
+		&& parent
+		&& parent->plan->vectorized)
+	{
+		state = vmthd.ExecInitExpr_Hook(node, parent);
+		if(NULL != state)
+			return state;
+	}
 
 	switch (nodeTag(node))
 	{

@@ -668,6 +668,8 @@ bool		gp_cte_sharing = false;
 
 char	   *gp_idf_deduplicate_str;
 
+int share_input_scan_wait_lockfile_timeout;
+
 /* gp_disable_catalog_access_on_segment */
 bool gp_disable_catalog_access_on_segment = false;
 
@@ -736,6 +738,7 @@ double	  optimizer_cost_threshold;
 double  optimizer_nestloop_factor;
 double  locality_upper_bound;
 double  net_disk_ratio;
+double hawq_hashjoin_bloomfilter_ratio;
 bool		optimizer_cte_inlining;
 int		optimizer_cte_inlining_bound;
 double 	optimizer_damping_factor_filter;
@@ -783,10 +786,8 @@ bool gp_plpgsql_clear_cache_always = false;
 bool gp_called_by_pgdump = false;
 
 char   *acl_type;
-
-char   *rps_addr_host;
-char   *rps_addr_suffix;
-int     rps_addr_port;
+int    rps_addr_port;
+int    rps_check_local_interval;
 
 /*
  * Displayable names for context types (enum GucContext)
@@ -5834,13 +5835,13 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"gp_hashjoin_bloomfilter", PGC_USERSET, GP_ARRAY_TUNING,
+		{"hawq_hashjoin_bloomfilter", PGC_USERSET, GP_ARRAY_TUNING,
 		 gettext_noop("Use bloomfilter in hash join"),
-		 gettext_noop("Use bloomfilter may speed up hashtable probing"),
+		 gettext_noop("Use bloomfilter may speed up hash join performance"),
 		 GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_GPDB_ADDOPT
 		},
-		&gp_hashjoin_bloomfilter,
-		1, 0, 1, NULL, NULL
+		&hawq_hashjoin_bloomfilter,
+		0, 0, 1, NULL, NULL
 	},
 
 	{
@@ -6268,13 +6269,22 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-    {"hawq_rps_address_port", PGC_POSTMASTER, PRESET_OPTIONS,
-      gettext_noop("ranger plugin server address port number"),
-      NULL
-    },
-    &rps_addr_port,
-    8432, 1, 65535, NULL, NULL
-  },
+		{"hawq_rps_address_port", PGC_POSTMASTER, PRESET_OPTIONS,
+			gettext_noop("ranger plugin server address port number"),
+			NULL
+		},
+		&rps_addr_port,
+		8432, 1, 65535, NULL, NULL
+	},
+
+	{
+		{"hawq_rps_check_local_interval", PGC_POSTMASTER, PRESET_OPTIONS,
+			gettext_noop("interval of checking master's RPS if talking with standby's RPS"),
+			NULL
+		},
+		&rps_check_local_interval,
+		300, 1, 65535, NULL, NULL
+	},
 
 	{
 		{"hawq_segment_address_port", PGC_POSTMASTER, PRESET_OPTIONS,
@@ -6678,6 +6688,15 @@ static struct config_int ConfigureNamesInt[] =
 		&metadata_cache_max_hdfs_file_num,
 		524288, 32768, 8388608, NULL, NULL
 	},
+	{
+		{"share_input_scan_wait_lockfile_timeout", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("timeout (in millisecond) for waiting lock file which writer creates."),
+			NULL
+		},
+		&share_input_scan_wait_lockfile_timeout,
+		300000, 1, INT_MAX, NULL, NULL
+	},
+
 
 	/* End-of-list marker */
 	{
@@ -7104,6 +7123,16 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&hawq_re_memory_quota_allocation_ratio,
 		0.5, 0.0, 1.0, NULL, NULL
+	},
+
+	{
+		{"hawq_hashjoin_bloomfilter_ratio", PGC_USERSET, GP_ARRAY_TUNING,
+			gettext_noop("Sets the ratio for hash join Bloom filter."),
+			NULL,
+			GUC_NO_SHOW_ALL
+		},
+		&hawq_hashjoin_bloomfilter_ratio,
+		0.4, 0.0, 1.0, NULL, NULL
 	},
 
 /* End-of-list marker */
@@ -8181,24 +8210,6 @@ static struct config_string ConfigureNamesString[] =
 	},
 
 	{
-		{"hawq_rps_address_host", PGC_POSTMASTER, PRESET_OPTIONS,
-			gettext_noop("ranger plugin server address hostname"),
-			NULL
-		},
-		&rps_addr_host,
-		"localhost", NULL, NULL
-	},
-
-	{
-		{"hawq_rps_address_suffix", PGC_POSTMASTER, PRESET_OPTIONS,
-			gettext_noop("ranger plugin server suffix of restful service address"),
-			NULL
-		},
-		&rps_addr_suffix,
-		"rps", NULL, NULL
-	},
-
-	{
 		{"hawq_acl_type", PGC_POSTMASTER, PRESET_OPTIONS,
 			gettext_noop("hawq acl mode, currently 'standalone' and 'ranger' is available"),
 			NULL
@@ -8252,14 +8263,14 @@ static struct config_string ConfigureNamesString[] =
 		"64GB", NULL, NULL
 	},
 
-    {
+	{
 		{"hawq_global_rm_type", PGC_POSTMASTER, RESOURCES_MGM,
 				gettext_noop("set resource management server type"),
 				NULL
 		},
 		&rm_global_rm_type,
 		"none", NULL, NULL
-    },
+	},
 
 	{
 		{"hawq_rm_yarn_address", PGC_POSTMASTER, RESOURCES_MGM,
@@ -8306,14 +8317,24 @@ static struct config_string ConfigureNamesString[] =
 		"", NULL, NULL
 	},
 
-    {
-        {"hawq_rm_stmt_vseg_memory", PGC_USERSET, RESOURCES_MGM,
-            gettext_noop("the memory quota of one virtual segment for one statement."),
-            NULL
-        },
-        &rm_stmt_vseg_mem_str,
-        "128mb", assign_hawq_rm_stmt_vseg_memory, NULL
-    },
+	{
+		{"hawq_rm_stmt_vseg_memory", PGC_USERSET, RESOURCES_MGM,
+			gettext_noop("the memory quota of one virtual segment for one statement."),
+			NULL
+		},
+		&rm_stmt_vseg_mem_str,
+		"128mb", assign_hawq_rm_stmt_vseg_memory, NULL
+	},
+
+	{
+		{"hawq_hashjoin_bloomfilter_max_memory_size", PGC_USERSET, GP_ARRAY_TUNING,
+			gettext_noop("The maximum memory size for bloom filter in hash join, with KB or MB"),
+			NULL,
+			GUC_NO_SHOW_ALL
+		},
+		&hawq_hashjoin_bloomfilter_max_memory_size,
+		"2mb", NULL, NULL
+	},
 
 	{
 		{"hawq_re_cgroup_mount_point", PGC_POSTMASTER, RESOURCES_MGM,
@@ -8359,7 +8380,6 @@ static struct config_string ConfigureNamesString[] =
 		&metadata_cache_testfile,
 		NULL, NULL, NULL
 	},
-
 
 	/* End-of-list marker */
 	{

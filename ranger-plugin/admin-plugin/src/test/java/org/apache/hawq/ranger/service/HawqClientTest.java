@@ -63,7 +63,7 @@ public class HawqClientTest {
     private Map<String, List<String>> resources;
 
     @Before
-    public void setUp() throws SQLException {
+    public void setUp() throws Exception {
         connectionProperties = new HashMap<>();
         connectionProperties.put("hostname", "hostname");
         connectionProperties.put("port", "5432");
@@ -73,7 +73,7 @@ public class HawqClientTest {
 
         mockStatic(DriverManager.class);
         suppress(constructor(BaseClient.class, String.class, Map.class));
-        hawqClient = new HawqClient(connectionProperties);
+        hawqClient = new HawqClient("hawq", connectionProperties);
 
         hawqClientSpy = PowerMockito.spy(hawqClient);
 

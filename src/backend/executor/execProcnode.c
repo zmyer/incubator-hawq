@@ -147,6 +147,7 @@
 #include "utils/debugbreak.h"
 #include "pg_trace.h"
 
+VectorExecMthd vmthd = {};
 #ifdef CDB_TRACE_EXECUTOR
 #include "nodes/print.h"
 static void ExecCdbTraceNode(PlanState *node, bool entry, TupleTableSlot *result);
@@ -269,6 +270,18 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 			node->type = T_BitmapTableScan;
 		}
 	}
+
+
+	/*
+    * If the plan node can be vectorized and vectorized is enable, enter the
+    * vectorized execution operators.
+    */
+	if(vmthd.vectorized_executor_enable
+	   && vmthd.ExecInitNode_Hook
+	   && node->vectorized
+	   && (result = vmthd.ExecInitNode_Hook(node,estate,eflags)))
+		return result;
+
 
 	switch (nodeTag(node))
 	{
@@ -749,10 +762,13 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 	if (estate->es_instrument && result != NULL) {
 		result->instrument = InstrAlloc(1);
 	}
+
 	if (result != NULL)
 	{
 		SAVE_EXECUTOR_MEMORY_ACCOUNT(result, curMemoryAccount);
 	}
+
+
 	return result;
 }
 
@@ -797,7 +813,7 @@ ExecSliceDependencyNode(PlanState *node)
 	ExecSliceDependencyNode(outerPlanState(node));
 	ExecSliceDependencyNode(innerPlanState(node));
 }
-    
+
 /* ----------------------------------------------------------------
  *		ExecProcNode
  *
@@ -885,6 +901,12 @@ ExecProcNode(PlanState *node)
 		CheckSendPlanStateGpmonPkt(node);
 
 	Assert(nodeTag(node) >= T_PlanState_Start && nodeTag(node) < T_PlanState_End);
+
+	if(vmthd.vectorized_executor_enable
+	   && vmthd.ExecProcNode_Hook
+	   && vmthd.ExecProcNode_Hook(node,&result))
+		goto Exec_Jmp_Done;
+
 	goto *ExecJmpTbl[nodeTag(node) - T_PlanState_Start];
 
 Exec_Jmp_Result:
@@ -1524,6 +1546,10 @@ ExecUpdateTransportState(PlanState *node, ChunkTransportState *state)
 void
 ExecEndNode(PlanState *node)
 {
+	if(vmthd.vectorized_executor_enable && vmthd.ExecEndNode_Hook
+	   && vmthd.ExecEndNode_Hook(node))
+		return ;
+
 	ListCell   *subp;
 
 	/*
@@ -1565,6 +1591,17 @@ ExecEndNode(PlanState *node)
         pfree(node->cdbexplainbuf);
         node->cdbexplainbuf = NULL;
     }
+
+	if(vmthd.vectorized_executor_enable
+	   && node->vectorized
+	   && vmthd.ExecEndNode_Hook
+	   && vmthd.ExecEndNode_Hook(node))
+	{
+		estate->currentSliceIdInPlan = origSliceIdInPlan;
+		estate->currentExecutingSliceId = origExecutingSliceId;
+
+		return ;
+	}
 
     switch (nodeTag(node))
 	{
